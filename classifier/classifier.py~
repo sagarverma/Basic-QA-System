@@ -1,0 +1,229 @@
+import re
+import fileinput
+import numpy
+import sys
+import os
+
+from sklearn.datasets.base import Bunch
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.cross_validation import StratifiedKFold, LeaveOneOut
+from sklearn.grid_search import GridSearchCV
+from sklearn.svm import LinearSVC
+from sklearn.externals import joblib
+
+from os import path, listdir
+from itertools import chain, product
+import numpy as np
+from nltk import pos_tag
+from sklearn.base import BaseEstimator
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, VectorizerMixin
+
+REL_WORDS_DIR = path.join(path.dirname(__file__), "rel_words")
+CURR_DIR = path.join(path.dirname(__file__), "model/")
+
+def build_word_lists():
+	""" build word lists from related words data """
+	word_list_files = listdir(REL_WORDS_DIR)
+	word_lists = {}
+	for wlf in word_list_files:
+		if wlf.startswith('.'):
+			continue
+		with open(path.join(REL_WORDS_DIR, wlf)) as f:
+			word_lists[wlf] = [word.strip().lower() for word in f.readlines()]
+	return word_lists
+
+class TagVectorizer(TfidfVectorizer):
+
+    def __init__(self, tags_only=False, input='content', encoding='utf-8', charset=None,
+                 decode_error='strict', charset_error=None,
+                 strip_accents=None, lowercase=True,
+                 preprocessor=None, tokenizer=None, analyzer='word',
+                 stop_words=None, token_pattern=r"(?u)\b\w\w+\b",
+                 ngram_range=(1, 1), max_df=1.0, min_df=1,
+                 max_features=None, vocabulary=None, binary=False,
+                 dtype=np.int64, norm='l2', use_idf=True, smooth_idf=True,
+                 sublinear_tf=False):
+        super(TagVectorizer, self).__init__(
+            input=input, charset=charset, charset_error=charset_error,
+            encoding=encoding, decode_error=decode_error,
+            strip_accents=strip_accents, lowercase=lowercase,
+            preprocessor=preprocessor, tokenizer=tokenizer, analyzer=analyzer,
+            stop_words=stop_words, token_pattern=token_pattern,
+            ngram_range=ngram_range, max_df=max_df, min_df=min_df,
+            max_features=max_features, vocabulary=vocabulary, binary=False,
+            dtype=dtype, norm=norm, use_idf=use_idf, smooth_idf=smooth_idf,
+            sublinear_tf=sublinear_tf)
+
+        self.tags_only = tags_only
+
+    def build_analyzer(self):
+        """Return a callable that handles preprocessing and tokenization"""
+
+        preprocess = self.build_preprocessor()
+        stop_words = self.get_stop_words()
+        tokenizer = self.build_tokenizer()
+        tokenize = lambda doc: tokenizer(preprocess(self.decode(doc)))
+
+        # nltk pos_tag returns tuples of the form (word, TAG)
+        if self.tags_only:
+            # We are just interested in the tags here, so we do tagged_tuple[1]
+            get_tags = lambda doc: [t[1] for t in pos_tag(tokenize(doc))]
+        else:
+            get_tags = lambda doc: list(chain.from_iterable(pos_tag(tokenize(doc))))
+        return lambda doc: self._word_ngrams(get_tags(doc), stop_words)
+
+class RelatedWordVectorizer(TfidfVectorizer):
+    # just create a new string of "rel_word" tags and pass it into a TfidfVectorizer
+    def __init__(self, input='content', encoding='utf-8', charset=None,
+                 decode_error='strict', charset_error=None,
+                 strip_accents=None, lowercase=True,
+                 preprocessor=None, tokenizer=None, analyzer='word',
+                 stop_words=None, token_pattern=r"(?u)\b\w\w+\b",
+                 ngram_range=(1, 1), max_df=1.0, min_df=1,
+                 max_features=None, vocabulary=None, binary=False,
+                 dtype=np.int64, norm='l2', use_idf=True, smooth_idf=True,
+                 sublinear_tf=False):
+        super(RelatedWordVectorizer, self).__init__(
+            input=input, charset=charset, charset_error=charset_error,
+            encoding=encoding, decode_error=decode_error,
+            strip_accents=strip_accents, lowercase=lowercase,
+            preprocessor=preprocessor, tokenizer=tokenizer, analyzer=analyzer,
+            stop_words=stop_words, token_pattern=token_pattern,
+            ngram_range=ngram_range, max_df=max_df, min_df=min_df,
+            max_features=max_features, vocabulary=vocabulary, binary=False,
+            dtype=dtype, norm=norm, use_idf=use_idf, smooth_idf=smooth_idf,
+            sublinear_tf=sublinear_tf)
+
+        self.word_lists = build_word_lists()
+
+    def build_analyzer(self):
+        """Return a callable that handles preprocessing and tokenization"""
+
+        preprocess = self.build_preprocessor()
+        tokenize = self.build_tokenizer()
+
+        return lambda doc: self._word_ngrams(self.build_rel_word_string(
+            tokenize(preprocess(self.decode(doc)))))
+
+    def get_rel_word(self, word):
+        for rel, words in self.word_lists.iteritems():
+            if word in words:
+                return rel
+        return ""
+
+    def build_rel_word_string(self, doc):
+        related_words = ""
+        for word in doc:
+            rel_word = self.get_rel_word(word)
+            if rel_word:
+                related_words += rel_word + " "
+        return related_words.strip()
+
+class Classifier:
+	
+	def __init__(self, init_data=None):
+		self.data = init_data
+		self.model_coarse = self.build_model()
+		self.model_fine = self.build_model()
+
+	def build_model(self):
+		model = Pipeline([
+			('union', FeatureUnion([
+				('words', TfidfVectorizer(max_df=0.25, ngram_range=(1, 4),
+									sublinear_tf=True, max_features=5000)),
+				('relword', RelatedWordVectorizer(max_df=0.75, ngram_range=(1, 4),
+									sublinear_tf=True)),
+				('pos', TagVectorizer(max_df=0.75, ngram_range=(1, 4),
+									sublinear_tf=True)),
+			])),
+			('clf', LinearSVC()),
+		])
+		return model
+
+	def train_model_for_coarse(self):
+		self.model_coarse.fit(self.data.data, self.data.target)
+
+	def train_model_for_fine(self):
+		self.model_fine.fit(self.data.data, self.data.fine_target)
+
+	def save_model(self):
+		joblib.dump(self.model_coarse, CURR_DIR + "coarse_model.pkl")
+		joblib.dump(self.model_fine, CURR_DIR + "fine_model.pkl")
+
+	def load_model(self):
+		self.model_coarse = joblib.load(CURR_DIR + "coarse_model.pkl")
+		self.model_fine = joblib.load(CURR_DIR + "fine_model.pkl")
+		return self
+
+	def classify(self, doc):
+		qtype_coarse = self.model_coarse.predict([doc])
+		qtype_fine = self.model_fine.predict([doc])
+		return qtype_coarse, qtype_fine
+
+def load_data(filename):
+	data = []
+	target = []
+	fine_target = []
+	data_re = re.compile(r'(\w+):(\w+) (.+)')
+
+	for line in fileinput.input(filename):
+		d = data_re.match(line)
+		target.append(d.group(1))
+		fine_target.append(d.group(2))
+		data.append(d.group(3))
+
+	return Bunch(
+		data = numpy.array(data),
+		target = numpy.array(target),
+		fine_target = numpy.array(fine_target),
+		target_names = set(target),
+		fine_target_names = set(fine_target),
+	)
+
+if __name__ == "__main__":
+	if sys.argv[1] == "train":
+		data = load_data("train_all.txt")
+		clf = Classifier(data)
+		print "Model created"
+		clf.train_model_for_coarse()
+		print "Coarse Model trained"
+		clf.train_model_for_fine()
+		print "Fine Model trained"
+		clf.save_model()
+		print "Models saved"
+	
+	if sys.argv[1] == "eval":
+		clf = Classifier()
+		clf.load_model()
+		f = open("TREC_10.txt",'r')
+		data_re = re.compile(r'(\w+):(\w+) (.+)')
+		coarse_count = 0
+		fine_count = 0
+		for line in f:
+			d = data_re.match(line)
+			coarse_class, fine_class = clf.classify(d.group(3))
+			if coarse_class == d.group(1):
+				coarse_count += 1
+			if fine_class == d.group(2):
+				fine_count += 1
+		print coarse_count/500.0, fine_count/500.0
+	
+	if sys.argv[1] == "classify":
+		clf = Classifier()
+		clf.load_model()
+		while True:
+			question = raw_input()
+			coarse_class, fine_class = clf.classify(question)
+			print coarse_class, fine_class
+	
+	if sys.argv[1] == 'classes':
+		data = load_data("train_all.txt")
+		print 'Coarse Classes'
+		print data.target_names
+		print 'Fine Classes'
+		res =  list(data.fine_target_names)
+		res = res.sort()
+		print type(res)
+		print res
+		print len(data.fine_target_names)
